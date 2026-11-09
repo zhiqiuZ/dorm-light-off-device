@@ -1,0 +1,20 @@
+# 便携工具链（≈427MB）：绝对不入库。别人用 build_firmware.bat 第一步会自动重建
+tools/
+
+# 本地实物照片：含宿舍环境隐私
+P/
+
+# 原始需求文档（个人文件，默认不公开；想入库删本行）
+1.docx
+
+# Office/编辑器临时件
+~$*
+*.tmp
+Thumbs.db
+.DS_Store
+
+# 编译残留（正常都在 tools/arduino/build，兜底）
+*.o
+*.elf
+build_st/
+_nl.txt
