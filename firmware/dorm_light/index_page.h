@@ -104,6 +104,21 @@ footer a{color:var(--mut)}
  <div class=ops><button class=save id=save>保存</button><button id=fact>恢复出厂默认</button></div>
  <div class=f style="margin-top:8px"><span id=eff></span></div>
 </div></details>
+<details id=vu><summary>语音 / 夜间模式</summary><div class=sec>
+ <style>#vt{width:100%;border-collapse:collapse}#vt td{padding:4px 2px;font-size:14px}#vt .hex{color:#8a93a6;font-size:12px}#vu input[type=time]{background:#25304a;color:#eaf0ff;border:0;border-radius:8px;padding:6px}#vframes{font-size:12px;color:#8a93a6;word-break:break-all}</style>
+ <div class=grp>语音（SU-03T）</div>
+ <div class=f><label>启用语音</label><input type=checkbox id=vEn></div>
+ <div class=f><span id=vBound style="color:#8a93a6">0/6 已绑定</span></div>
+ <div class=warn>ℹ 学习绑定，不用抄协议：点「学」→ 15 秒内对模块喊唤醒词 + 说出那条命令 → 装置自动记住那串字节。</div>
+ <table id=vt></table>
+ <div class=grp>最近收到的帧（调试）</div>
+ <div id=vframes>—</div>
+ <div class=grp>夜间模式（省电）</div>
+ <div class=f><label>窗口外深睡省电</label><input type=checkbox id=pwEn></div>
+ <div class=f><label>醒着时段</label><input type=time id=pwS value="19:30"> → <input type=time id=pwE value="02:30"></div>
+ <div class=ops><button id=pwApply>应用</button></div>
+ <div class=f><span id=pwState style="color:#8a93a6;font-size:12px">—</span></div>
+</div></details>
 <details id=hp><summary>帮助 / 常见问题</summary><div class=sec id=help>
  <b>1. 怎么连上</b>：手机 WiFi 连 <code>GUANGDENG</code>，密码 <code>111222345</code>，
  浏览器开 <code>http://192.168.4.1</code>。若提示"无互联网"选<b>继续/保持</b>——正常现象。
@@ -114,7 +129,9 @@ footer a{color:var(--mut)}
  ③ 页面拉到底点"诊断"，看装置是否重启/内存异常；④ 还不行 → 拔电再开。<br>
  <b>4. 全关为什么慢一点</b>：两个舵机<b>轮流干活</b>（先左后右），防止同时启动把电压拉垮——故意的。<br>
  <b>5. 哪边是左哪边是右</b>：以<b>面对开关面板</b>为准。装完先用设置页"试·关左/关右"认路，装反了勾"方向镜像"。<br>
- <b>6. 舵机动作变慢/推不动</b>：给电池充电（常挂链自动充），或在设置里调慢速度档、加过行程。
+ <b>6. 舵机动作变慢/推不动</b>：给电池充电（常挂链自动充），或在设置里调慢速度档、加过行程。<br>
+ <b>7. 白天连不上热点</b>：正常——"夜间模式"下装置只在醒着时段（默认 19:30~02:30）开热点和语音，其余时间深睡省电（续航 3~5 天）。随时想用时进"语音 / 夜间模式"把它关掉。<b>手动按开关任何时候都不受影响</b>。<br>
+ <b>8. 语音没反应</b>：① 语音开关是否被关；② 是否喊了唤醒词后 7 秒内说的命令；③ 装置是否处于窗口外（白天在睡觉）；④ "语音 / 夜间模式"→最近帧一片空白=模块没送话（查 D7/D6 线与 9600 波特率设置）。
 </div></details>
 <footer>
  <span id=facts>—</span>
@@ -148,6 +165,8 @@ async function refresh(first){const{code,j}=await api("/status",null,2500);
  $("#facts").textContent="本次开机已执行 "+j.countThisBoot+" 次 · "+(j.lastAction==="-"?"尚无动作":fmtAge(j.lastActionAgeSec)+" "+lbl(j.lastAction));
  $("#ver").textContent="v"+j.fwVer;
  if(!inited){inited=true;loadParams();}
+ if(!tsDone){tsDone=true;api("/time?ts="+Date.now(),{method:"POST"});}   // D10：手机即时钟（醒来窗口全靠它）
+ paintSys(j);
  if(pending){pollAct();}}
 let inited=false,pending=false,busyNow=false;
 function pollAct(){clearTimeout(actTimer);
@@ -222,6 +241,30 @@ $("#fact").onclick=async()=>{if(!confirm("恢复出厂默认会清掉左右灯�
  const{code}=await api("/factoryReset",{method:"POST"});
  if(code==200){toast("已恢复默认，请重新校准左右灯");loadParams();}else toast("失败：装置忙或无响应",1);};
 function showHelp(){const h=$("#hp");h.open=true;h.scrollIntoView({behavior:"smooth"});}
+// --- v3 语音 / 夜间模式 ---
+let tsDone=false;
+function paintSys(j){
+ if(j.voice){$("#vEn").checked=!!j.voice.en;$("#vBound").textContent=j.voice.bound+"/6 已绑定"+(j.voice.hit!=="-"?" · 上次语音:"+lbl(j.voice.hit):"");}
+ if(j.pw){$("#pwEn").checked=!!j.pw.en;
+  $("#pwState").textContent=(j.pw.clock?"时钟已同步":"时钟未同步")+" · 醒着 "+j.pw.win+(j.pw.inWin?" · 当前在窗口内":" · 当前窗口外（闲置 5 分钟后自动深睡）");}}
+async function loadVoice(){const{code,j}=await api("/voice");if(code!=200||!j)return;
+ const tb=$("#vt");tb.innerHTML="";
+ j.slots.forEach(s=>{const tr=document.createElement("tr");
+  tr.innerHTML="<td>"+s.name+"</td><td class=hex>"+(s.hex||"未绑定")+"</td><td><button data-learn="+s.code+">学</button> <button data-del="+s.code+">清</button></td>";
+  tb.appendChild(tr);});
+ tb.querySelectorAll("[data-learn]").forEach(b=>b.onclick=async()=>{
+  const{code:c,j:x}=await api("/voiceLearn?code="+b.dataset.learn,{method:"POST"});
+  if(c==200){toast("15 秒内：喊唤醒词 + 说「"+(x&&x.armed?x.armed:"该命令")+"」");let n=0;
+   const iv=setInterval(()=>{loadVoice();if(++n>10)clearInterval(iv);},1500);}});
+ tb.querySelectorAll("[data-del]").forEach(b=>b.onclick=async()=>{await api("/voiceDel?code="+b.dataset.del,{method:"POST"});loadVoice();});
+ $("#vframes").textContent=(j.frames||[]).filter(fx=>fx.hex).map(fx=>fx.hex+"（"+fx.ageSec+"s 前）").join(" ｜ ")||"暂无 —— 唤醒模块喊一嗓子看看";}
+$("#vu").addEventListener("toggle",()=>{if($("#vu").open)loadVoice();});
+$("#vEn").onchange=async e=>{const{code}=await api("/voiceEn?on="+(e.target.checked?1:0),{method:"POST"});
+ if(code!=200){e.target.checked=!e.target.checked;toast("设置失败",1);}else toast(e.target.checked?"语音已启用":"语音已停用");};
+$("#pwApply").onclick=applyPw;
+async function applyPw(){const en=$("#pwEn").checked?1:0,st=$("#pwS").value||"19:30",ed=$("#pwE").value||"02:30";
+ const{code}=await api("/pwSet?en="+en+"&start="+st+"&end="+ed,{method:"POST"});
+ if(code==200){toast("已应用（若正处窗口外，闲置 5 分钟后生效）");refresh();}else toast("设置失败",1);}
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)refresh();});
 refresh(1);
 </script>

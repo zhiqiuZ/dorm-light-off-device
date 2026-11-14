@@ -1,6 +1,8 @@
 /*
-  宿舍智能机械关灯装置 — 固件 v2.0.0（双舵机双通道）
+  宿舍智能机械关灯装置 — 固件 v3.0.0（双舵机 + SU-03T 语音 + 夜间深眠）
   NodeMCU(ESP8266) + 左灯 SG90(D2/GPIO4) + 右灯 MG90S(D5/GPIO14)（PRD D2 + D8 定案）
+  语音：SU-03T @ D7(RX)/D6(TX) 9600bps；不猜厂商协议——页面"学习绑定"实测帧（PRD D9）
+  电源：夜间深眠窗口（默认 19:30~02:30），窗口外主控深睡 + 语音门控断电（PRD D10）
 
   实现依据（本文件所有编号对应设计文档）：
     FIRMWARE_DESIGN.md  §3 动作状态机 / §4 角度限位 / §5 并发去重 / §6 参数存储
@@ -26,11 +28,12 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <DNSServer.h>          // 核心自带：captive portal 手法（D7 定案）
+#include <SoftwareSerial.h>     // 核心自带：SU-03T 语音串口（D9）
 #include <Servo.h>
 #include <EEPROM.h>
 #include <Updater.h>
 
-#define FIRMWARE_VERSION "2.0.0"
+#define FIRMWARE_VERSION "3.0.0"
 
 // ============================================================
 // 1. 承载层常量（FIRMWARE_DESIGN §10 / PRD OA-2、OA-5、OA-7 定案）
@@ -50,6 +53,18 @@ static const uint8_t CH_R        = 1;
 static const uint8_t SERVO_PINS[NUM_CH] = {4, 14};   // 左 D2/GPIO4，右 D5/GPIO14
 static const uint8_t LED_PIN     = 2;                // 板载 LED（低电平亮），仅状态指示
 
+// --- v3.0.0：语音（D9）与电源调度（D10）引脚/常量 ---
+static const uint8_t  VOICE_RX_PIN = 13;             // D7 ← SU-03T TX
+static const uint8_t  VOICE_TX_PIN = 12;             // D6 → SU-03T RX（v3 空闲，预留回执帧）
+static const uint8_t  VOICE_GATE   = 15;             // D8 → 三极管基极(1kΩ)：HIGH=语音上电；开机天然 LOW 安全
+static const uint32_t VOICE_BAUD   = 9600;           // 配置工具必须把 SU-03T 波特率改成 9600
+static const uint32_t FRAME_GAP_MS = 40;             // 帧间静默 = 判帧边界（协议无关学习法）
+static const uint8_t  VSLOTS       = 6;              // 学习槽 1..6（见 VLBL 表）
+static const uint8_t  VFRAME_MAX   = 8;              // 单帧最长字节数
+static const uint16_t PW_START_DEF = 19 * 60 + 30;   // 窗口默认 19:30 开
+static const uint16_t PW_END_DEF   = 2 * 60 + 30;    // 次日 02:30 关
+static const uint32_t PW_CHUNK_S   = 1800;           // 深睡分片 ≤30min（RTC 定时器安全范围内）
+
 // 安全常量（FIRMWARE_DESIGN §4）
 static const int      DEG_MIN   = 10;                // 角度上下限（两端各留 10° 避开死区/顶死）
 static const int      DEG_MAX   = 170;
@@ -61,7 +76,7 @@ static const uint32_t OTA_GRACE_MS = 45000;          // 新固件 45 秒存活�
 
 // ============================================================
 // 2. 参数块与持久化（§6 + §十六）
-//    EEPROM 分区：0..99 参数块；128..147 OTA 状态（分开写，减少互相磨损）
+//    EEPROM 分区：0..99 参数块；128..147 OTA 状态；160..217 语音区；228..235 电源区
 // ============================================================
 static const uint16_t EEPROM_SIZE   = 256;
 static const uint16_t ADDR_PARAMS   = 0;
@@ -95,6 +110,87 @@ static const uint8_t  P_VER   = 2;        // v2：双通道结构换代，v1 数
 
 Params P;
 OtaState O = {0, 0, 0};
+
+// ============================================================
+// 2b. 语音区（@160）与电源区（@228）——独立于参数块存放。
+//     刻意不 bump P_VER：v2→v3 升级，左右校准值原封不动（吸取 v1→v2 全报废的教训）
+// ============================================================
+static const uint16_t ADDR_VOICECFG = 160;
+static const uint16_t ADDR_PWCFG    = 228;
+static const uint16_t V_MAGIC  = 0x5156;   // 'QV'
+static const uint16_t PW_MAGIC = 0x5150;   // 'QP'
+
+struct VSlot { uint8_t len; uint8_t b[VFRAME_MAX]; };          // 动作码 = 下标+1
+struct VoiceCfg { uint16_t magic; uint8_t en; VSlot slots[VSLOTS]; uint8_t csum; };
+struct PwCfg    { uint16_t magic; uint8_t en; uint16_t winStart, winEnd; uint8_t csum; };
+VoiceCfg VC;
+PwCfg    PW;
+
+static const char* VLBL[VSLOTS + 1] = { "-", "off-all", "off-L", "off-R", "on-all", "on-L", "on-R" };
+static const char* VCNAME[VSLOTS + 1] = { "-", "全关", "关左灯", "关右灯", "全开", "开左灯", "开右灯" };
+
+uint8_t boundCount() { uint8_t n = 0; for (uint8_t i = 0; i < VSLOTS; i++) if (VC.slots[i].len && VC.slots[i].len <= VFRAME_MAX) n++; return n; }
+String hmStr(uint16_t m) { char b[6]; sprintf(b, "%02u:%02u", (unsigned)(m / 60) % 24, (unsigned)(m % 60)); return String(b); }
+
+uint8_t csum8(const uint8_t* b, size_t n) { uint8_t s = 0; for (size_t i = 0; i + 1 < n; i++) s += b[i]; return s; }
+
+bool voiceLoad() {
+  EEPROM.get(ADDR_VOICECFG, VC);
+  if (VC.magic == V_MAGIC && VC.csum == csum8((uint8_t*)&VC, sizeof(VC))) return true;
+  VC.magic = V_MAGIC; VC.en = 1; memset(VC.slots, 0, sizeof(VC.slots));
+  VC.csum = csum8((uint8_t*)&VC, sizeof(VC));
+  return false;
+}
+bool voiceSave() {
+  VC.csum = csum8((uint8_t*)&VC, sizeof(VC));
+  EEPROM.put(ADDR_VOICECFG, VC);
+  return EEPROM.commit();
+}
+bool pwLoad() {
+  EEPROM.get(ADDR_PWCFG, PW);
+  if (PW.magic == PW_MAGIC && PW.csum == csum8((uint8_t*)&PW, sizeof(PW))) return true;
+  PW.magic = PW_MAGIC; PW.en = 1; PW.winStart = PW_START_DEF; PW.winEnd = PW_END_DEF;
+  PW.csum = csum8((uint8_t*)&PW, sizeof(PW));
+  return false;
+}
+bool pwSave() {
+  PW.csum = csum8((uint8_t*)&PW, sizeof(PW));
+  EEPROM.put(ADDR_PWCFG, PW);
+  return EEPROM.commit();
+}
+
+// ---- 帧接收状态（gap 判帧；学习绑定后持久化） ----
+SoftwareSerial voiceSer(VOICE_RX_PIN, VOICE_TX_PIN);
+uint8_t  rxFrame[VFRAME_MAX + 1]; uint8_t rxLen = 0; uint32_t rxLastAt = 0;
+char     frameRing[6][3 * VFRAME_MAX];  uint32_t frameRingAt[6]; uint8_t ringPos = 0;
+uint8_t  learnArmed = 0;        uint32_t learnDeadline = 0;
+char     lastVoiceHit[12] = "-";  uint32_t lastVoiceHitAt = 0;
+
+// ---- 时间基准：RTC 内存跨深睡存活；断电丢失 → 未校准期间保持常醒（页面开一次即恢复） ----
+static const uint32_t RTC_MAGIC = 0xD17E;
+uint32_t epochBase = 0, anchorMs = 0; bool timeOk = false;
+void rtcGet() {
+  uint32_t w[2]; timeOk = false;
+  if (ESP.rtcUserMemoryRead(16, w, 8) && w[0] == RTC_MAGIC) {
+    epochBase = w[1]; anchorMs = millis(); timeOk = true;
+  }
+}
+void rtcPut() { uint32_t w[2] = { RTC_MAGIC, epochBase }; ESP.rtcUserMemoryWrite(16, w, 8); }
+uint32_t epochNow() { return timeOk ? epochBase + (uint32_t)((millis() - anchorMs) / 1000) : 0; }
+uint32_t minuteOfDay() { return (epochNow() / 60) % 1440; }
+
+bool inWindow() {
+  if (!timeOk || !PW.en || PW.winStart == PW.winEnd) return true;    // 无时钟/未启用 = 常醒
+  uint32_t m = minuteOfDay();
+  if (PW.winStart < PW.winEnd) return m >= PW.winStart && m < PW.winEnd;
+  return m >= PW.winStart || m < PW.winEnd;                           // 跨午夜窗口
+}
+int32_t minutesToStart() {                                            // 仅窗口外调用
+  int32_t d = (int32_t)PW.winStart - (int32_t)minuteOfDay();
+  if (d < 0) d += 1440;
+  return d;
+}
+uint32_t lastHttpMs = 0;                                              // 深睡前 5 分钟宽限：有人正用页面就别睡
 
 void paramsDefaults() {
   P.magic = P_MAGIC; P.ver = P_VER;
@@ -345,6 +441,88 @@ void servoFollowHome() {
 }
 
 // ============================================================
+// 4b. v3.0.0 语音链路（D9）：学习绑定 → 帧匹配 → 走同一条 startAction
+//     + 夜间深眠调度（D10）。全部非阻塞。
+// ============================================================
+void gateUpdate() { digitalWrite(VOICE_GATE, (VC.en && inWindow() && !otaGrace) ? HIGH : LOW); }
+
+void gotoSleep() {
+  if (busy || otaLock || otaGrace) return;
+  servoOff();
+  digitalWrite(VOICE_GATE, LOW);
+  int32_t waitS = minutesToStart() * 60;
+  uint32_t chunkS = (waitS > (int32_t)PW_CHUNK_S) ? PW_CHUNK_S : (uint32_t)waitS;
+  if (chunkS < 2) { gateUpdate(); return; }                     // 已到窗口点，继续醒着
+  epochBase += chunkS; rtcPut();
+  Serial.printf("[pw] sleep %us (window-open in %d min)\n", (unsigned)chunkS, (int)(waitS / 60));
+  delay(120);
+  ESP.deepSleep((uint64_t)chunkS * 1000000ULL, (waitS <= (int32_t)PW_CHUNK_S + 60) ? WAKE_RF_DEFAULT : WAKE_NO_RFCAL);
+}
+void loopPower() {
+  static uint32_t nextCheck = 0;
+  uint32_t now = millis();
+  if (now < nextCheck) return;
+  nextCheck = now + 2000;
+  if (!PW.en || !timeOk || inWindow()) return;
+  if (now - lastHttpMs < 300000) return;                        // 页面还在用：宽限 5 分钟
+  if (busy || otaLock || otaGrace) return;
+  gotoSleep();                                                  // 不返回，直到下个分片醒来
+}
+
+void frameHex(const uint8_t* b, uint8_t n, char* out) {
+  out[0] = 0;
+  for (uint8_t i = 0; i < n; i++) { sprintf(out + strlen(out), (i ? " %02X" : "%02X"), b[i]); }
+}
+bool slotFilled(const VSlot* s) { return s->len > 0 && s->len <= VFRAME_MAX; }
+
+void voiceFire(uint8_t code) {                                  // 1..6 → 与网页同锁同去重（去重戳复用）
+  uint8_t side = (code <= 3) ? S_OFF : S_ON;
+  uint8_t mask = (code == 1 || code == 4) ? (uint8_t)0b11 : (code == 2 || code == 5) ? (uint8_t)(1 << CH_L) : (uint8_t)(1 << CH_R);
+  if (otaGrace || otaLock || busy) { Serial.println("[voice] rejected (busy/grace)"); return; }
+  uint32_t now = millis();
+  uint32_t* ref = &dedupAt[side - 1][mask - 1];
+  if (now - *ref < DEDUP_MS) { Serial.println("[voice] deduped"); return; }
+  *ref = now;
+  snprintf(lastVoiceHit, sizeof(lastVoiceHit), "%s", VLBL[code]); lastVoiceHitAt = epochNow();
+  if (startAction(side, mask, VLBL[code], false))
+    Serial.printf("[voice] %s -> %s\n", VCNAME[code], VLBL[code]);
+}
+
+void frameDone() {                                              // 一帧收满（靠 40ms 静默收尾）
+  char hex[3 * VFRAME_MAX]; frameHex(rxFrame, rxLen, hex);
+  Serial.printf("[voice] frame: %s\n", hex);
+  ringPos = (uint8_t)((ringPos + 1) % 6);
+  snprintf(frameRing[ringPos], sizeof(frameRing[0]), "%s", hex);
+  frameRingAt[ringPos] = millis();
+  if (learnArmed) {                                             // 学习模式：把这一帧焊死到动作槽
+    VSlot* s = &VC.slots[learnArmed - 1];
+    s->len = rxLen; memcpy(s->b, rxFrame, rxLen);
+    if (!voiceSave()) Serial.println("[voice] save FAILED");
+    Serial.printf("[voice] bound slot %u '%s' <- %s\n", learnArmed, VCNAME[learnArmed], hex);
+    learnArmed = 0; rxLen = 0; return;
+  }
+  for (uint8_t i = 0; i < VSLOTS; i++) {
+    VSlot* s = &VC.slots[i];
+    if (slotFilled(s) && s->len == rxLen && memcmp(s->b, rxFrame, rxLen) == 0) { voiceFire((uint8_t)(i + 1)); break; }
+  }
+  rxLen = 0;
+}
+void loopVoice() {
+  if (!VC.en) { while (voiceSer.available()) voiceSer.read(); return; }   // 停用：只排空不误触发
+  while (voiceSer.available()) {
+    uint8_t c = (uint8_t)voiceSer.read();
+    uint32_t now = millis();
+    if (rxLen && now - rxLastAt > FRAME_GAP_MS) frameDone();
+    if (rxLen < VFRAME_MAX) rxFrame[rxLen++] = c;
+    else { rxFrame[VFRAME_MAX - 1] = c; }                        // 超长帧：保留尾部继续
+    rxLastAt = now;
+  }
+  uint32_t now = millis();
+  if (rxLen && now - rxLastAt > FRAME_GAP_MS) frameDone();
+  if (learnArmed && now > learnDeadline) { learnArmed = 0; Serial.println("[voice] learn timeout"); }
+}
+
+// ============================================================
 // 5. JSON 输出（§8 契约；字符串量小且短命，§12.2 可接受）
 // ============================================================
 String jb(bool b) { return b ? F("true") : F("false"); }
@@ -354,7 +532,7 @@ String statusJson(bool diag = false) {
   String s; s.reserve(420);
   s  = "{\"ok\":true,\"online\":true";
   s += ",\"fwVer\":\"" FIRMWARE_VERSION "\"";
-  s += ",\"apiVer\":2";
+  s += ",\"apiVer\":3";
   s += ",\"busy\":" + jb(busy || otaLock || otaGrace);
   s += ",\"state\":\"" + String(stateName()) + "\"";
   s += ",\"grace\":" + jb(otaGrace);
@@ -369,6 +547,10 @@ String statusJson(bool diag = false) {
   s += ",\"freeHeap\":" + String(ESP.getFreeHeap());
   s += ",\"stationCount\":" + String(WiFi.softAPgetStationNum());
   s += ",\"maxSta\":4";
+  s += ",\"voice\":{\"en\":" + jb(VC.en) + ",\"bound\":" + String(boundCount()) + ",\"armed\":" + jb(learnArmed != 0);
+  s += ",\"hit\":\"" + String(lastVoiceHit) + "\"}";
+  s += ",\"pw\":{\"en\":" + jb(PW.en) + ",\"clock\":" + jb(timeOk) + ",\"inWin\":" + jb(inWindow());
+  s += ",\"win\":\"" + hmStr(PW.winStart) + "~" + hmStr(PW.winEnd) + "\"}";
   s += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
   s += ",\"apChan\":" + String(AP_CHANNEL);
   if (diag) {
@@ -379,6 +561,7 @@ String statusJson(bool diag = false) {
     s += ",\"updateSpace\":" + String(ESP.getFreeSketchSpace());
     s += ",\"flashSize\":" + String(ESP.getFlashChipRealSize());
     s += ",\"pins\":{\"L\":" + String(SERVO_PINS[CH_L]) + ",\"R\":" + String(SERVO_PINS[CH_R]) + "}";
+    s += ",\"voicePins\":{\"rx\":13,\"tx\":12,\"gate\":15}";
   }
   s += "}";
   return s;
@@ -433,12 +616,14 @@ bool argInt(const char* name, int& out) {
   return true;
 }
 
-void handleIndex()   { server.send_P(200, "text/html", PAGE_HTML); }
+inline void touch() { lastHttpMs = millis(); }       // D10：页面活跃时间戳（深睡宽限用）
+
+void handleIndex()   { touch(); server.send_P(200, "text/html", PAGE_HTML); }
 void handleFavicon() { server.send(204, "text/plain", ""); }
-void handleStatus()  { server.send(200, "application/json", statusJson()); }
+void handleStatus()  { touch(); server.send(200, "application/json", statusJson()); }
 
 void handleDiag() {
-  server.send(200, "application/json", statusJson(true));
+  touch(); server.send(200, "application/json", statusJson(true));
 }
 
 void handleGetParams() { server.send(200, "application/json", paramsJson()); }
@@ -520,6 +705,70 @@ void handleFactoryReset() {
 void handleReboot() {
   server.send(200, "application/json", "{\"ok\":true,\"note\":\"reboot in 1s\"}");
   rebootAt = millis() + 1000;
+}
+
+// ---- v3 端点（D9/D10）----
+void handleVoice() {                                   // GET：槽位 + 最近抓帧（sniffer 已内化在此）
+  String s; s.reserve(520);
+  s  = "{\"ok\":true,\"en\":" + jb(VC.en) + ",\"armed\":" + String((int)learnArmed);
+  s += ",\"slots\":[";
+  for (uint8_t i = 0; i < VSLOTS; i++) {
+    VSlot* q = &VC.slots[i];
+    char hex[3 * VFRAME_MAX]; hex[0] = 0;
+    if (slotFilled(q)) frameHex(q->b, q->len, hex);
+    if (i) s += ",";
+    s += "{\"code\":" + String(i + 1) + ",\"name\":\"" + String(VCNAME[i + 1]) +
+         "\",\"label\":\"" + String(VLBL[i + 1]) + "\",\"hex\":\"" + String(hex) + "\"}";
+  }
+  s += "],\"frames\":[";
+  for (uint8_t k = 0; k < 6; k++) {
+    uint8_t idx = (uint8_t)((ringPos + 1 + k) % 6);
+    if (k) s += ",";
+    s += "{\"hex\":\"" + String(frameRing[idx]) + "\",\"ageSec\":" +
+         String((uint32_t)(millis() - frameRingAt[idx]) / 1000) + "}";
+  }
+  s += "]}";
+  server.send(200, "application/json", s);
+}
+void handleVoiceLearn() {
+  int code; if (!argInt("code", code) || code < 1 || code > VSLOTS) { server.send(400, "application/json", errJson(2)); return; }
+  learnArmed = (uint8_t)code; learnDeadline = millis() + 15000;
+  server.send(200, "application/json", "{\"ok\":true,\"armed\":\"" + String(VCNAME[code]) + "\",\"note\":\"对 SU-03T 唤醒并说该命令一次\"}");
+}
+void handleVoiceDel() {
+  int code; if (!argInt("code", code) || code < 0 || code > VSLOTS) { server.send(400, "application/json", errJson(2)); return; }
+  if (code == 0) memset(VC.slots, 0, sizeof(VC.slots));
+  else memset(&VC.slots[code - 1], 0, sizeof(VSlot));
+  bool ok = voiceSave();
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : errJson(8));
+}
+void handleVoiceEn() {
+  int on; if (!argInt("on", on)) { server.send(400, "application/json", errJson(2)); return; }
+  VC.en = on ? 1 : 0; voiceSave(); gateUpdate();
+  server.send(200, "application/json", "{\"ok\":true,\"en\":" + jb(VC.en) + "}");
+}
+void handlePwSet() {
+  int en; if (argInt("en", en)) PW.en = en ? 1 : 0;
+  if (server.hasArg("start")) {
+    String a = server.arg("start"); int c = a.indexOf(':');
+    if (c >= 1 && c <= 2) { int v = a.substring(0, c).toInt() * 60 + a.substring(c + 1).toInt();
+      if (v >= 0 && v <= 1439) PW.winStart = (uint16_t)v; }
+  }
+  if (server.hasArg("end")) {
+    String a = server.arg("end"); int c = a.indexOf(':');
+    if (c >= 1 && c <= 2) { int v = a.substring(0, c).toInt() * 60 + a.substring(c + 1).toInt();
+      if (v >= 0 && v <= 1439) PW.winEnd = (uint16_t)v; }
+  }
+  bool ok = pwSave(); lastHttpMs = millis();
+  server.send(200, "application/json", "{\"ok\":true,\"en\":" + jb(PW.en) +
+    ",\"win\":\"" + hmStr(PW.winStart) + "~" + hmStr(PW.winEnd) + "\"}");
+}
+void handleTimeSync() {                                 // 手机页面开一次 = 装置时钟校准（无外网 NTP，D10 依赖）
+  if (!server.hasArg("ts")) { server.send(400, "application/json", errJson(2)); return; }
+  double t = server.arg("ts").toDouble();
+  if (t > 1e12) t /= 1000.0;                            // 毫秒兼容
+  epochBase = (uint32_t)t; anchorMs = millis(); timeOk = true; rtcPut();
+  server.send(200, "application/json", "{\"ok\":true,\"inWin\":" + jb(inWindow()) + "}");
 }
 
 void handleNotFound() {                 // v1.1.0：系统联网探测 → 按其期望应答（让 OS 认为"有网"，不踢）
@@ -615,13 +864,24 @@ void setup() {
   pinMode(SERVO_PINS[CH_L], INPUT);                            // 启动阶段绝不驱动信号脚（§4）
   pinMode(SERVO_PINS[CH_R], INPUT);
   Serial.begin(115200);
-  Serial.println("\n=== dorm light-off device " FIRMWARE_VERSION " (dual channel) ===");
+  Serial.println("\n=== dorm light-off device " FIRMWARE_VERSION " (dual + voice + night) ===");
 
   EEPROM.begin(EEPROM_SIZE);
   bool loaded = paramsLoad();
   Serial.printf("[cfg] params %s\n", loaded ? "loaded" : "corrupt/old-version/first-run -> defaults");
   if (!loaded) lastErr = 5;
+  bool vFresh = voiceLoad(), pFresh = pwLoad();
+  rtcGet();
+  Serial.printf("[cfg] voice %s pw %s clock %s (win %s~%s)\n",
+                vFresh ? "loaded" : "new-defaults", pFresh ? "loaded" : "new-defaults",
+                timeOk ? "kept" : "lost(全断电)", hmStr(PW.winStart).c_str(), hmStr(PW.winEnd).c_str());
+  pinMode(VOICE_GATE, OUTPUT); digitalWrite(VOICE_GATE, LOW);
   otaGraceBeginOrCheck();
+
+  // D10 快睡路径：定时醒来看表，不在窗口就立刻回去——不开 AP、不起语音，省一整段启动
+  if (PW.en && timeOk && !inWindow() && !otaGrace) gotoSleep();   // 不返回
+  gateUpdate();
+  if (VC.en) { voiceSer.begin(VOICE_BAUD); Serial.println("[voice] SU-03T uart @9600 RX=D7 TX=idle-D6"); }
 
   // 承载层：纯 AP（§10）
   WiFi.mode(WIFI_AP);
@@ -645,6 +905,12 @@ void setup() {
   server.on("/setParams", HTTP_POST, handleSetParams);
   server.on("/factoryReset", HTTP_POST, handleFactoryReset);
   server.on("/reboot", HTTP_POST, handleReboot);
+  server.on("/voice", HTTP_GET, handleVoice);
+  server.on("/voiceLearn", HTTP_POST, handleVoiceLearn);
+  server.on("/voiceDel", HTTP_POST, handleVoiceDel);
+  server.on("/voiceEn", HTTP_POST, handleVoiceEn);
+  server.on("/pwSet", HTTP_POST, handlePwSet);
+  server.on("/time", HTTP_POST, handleTimeSync);
   server.on("/ota", HTTP_GET, handleOtaPage);
   server.on("/update", HTTP_POST, handleOtaDone, handleOtaUpload);
   server.onNotFound(handleNotFound);
@@ -660,6 +926,8 @@ void loop() {
   server.handleClient();                               // 单 client 串行（§5.4）
   dnsServer.processNextRequest();                      // 每轮最多 1 个 DNS 包，µs 级
   loopAction();
+  loopVoice();                                         // D9：帧接收/学习绑定（全非阻塞）
+  loopPower();                                         // D10：窗口检查（2s 节拍）
   otaGraceTick();
   MDNS.update();
 

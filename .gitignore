@@ -18,3 +18,6 @@ Thumbs.db
 *.elf
 build_st/
 _nl.txt
+
+# 修复工具时的一次性下载目录
+tmp_git/

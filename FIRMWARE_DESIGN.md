@@ -259,3 +259,10 @@ RETURN ──▶ DETACH（停 PWM，舵机彻底松劲）──▶ POST（记结
 - **§6 参数块 P_VER=2**：`angleOff/angleOn/angleHome[NUM_CH]` + `mirrorBits`/`calibrated` 位图；v1 数据版本失配 → 自动回默认（**升级后必须重校准**）。`speedMode/holdMs/returnHome` 保持全局。
 - **§8 契约 apiVer=2**：`/press` 增 `ch=l|r|all`（缺省 all 兼容旧客户端）；去重戳改 `[side][mask]` 二维；`/params` 键改 `angleOffL/angleOnL/angleHomeL/mirrorL` + R 组同名 + `effL/effR`；`/setParams` 同步，保存 = 双通道整体置 calibrated=0b11；`/status` 增 `calL/calR`，`lastAction ∈ {off-L,on-L,off-R,on-R,off-all,on-all}`；`/diag` 增 `pins{L,R}`。
 - `servoFollowHome()`：两通道先后各 attach+写中位，统一 350ms 后一起松劲。
+
+## 十七、语音与夜间深眠（v3.0.0 / D9+D10）
+- **引脚**：语音 RX=D7/GPIO13（←SU-03T TX），TX=D6/GPIO12（预留），门控=D8/GPIO15→1kΩ→S8050 基极（SU-03T 低边断电）。舵机 D2/D5 不变；GPIO15 开机必须低=天然"语音关"，安全。
+- **帧学习绑定**：SoftwareSerial@9600；40ms 静默判帧（≤8 字节）；/voiceLearn?code=N 武装 15s；命中帧字节→写 VC.slots[N-1]（EEPROM@160，区独立于 P_VER=2 参数块——v2 校准零报废）；匹配帧→voiceFire→与 HTTP 同一条 startAction/去重戳/动作锁。
+- **深眠调度**：窗口 [winStart,winEnd) 跨午夜支持；loopPower 2s 节拍；窗口外且页面闲置 >5min→gotoSleep：epochBase+=chunk、rtcPut、深睡分片 ≤1800s（长眠多跳；末片 WAKE_RF_DEFAULT，中段 WAKE_NO_RFCAL 省 1 秒）。setup 顶部有"醒来即再睡"快路径（不开 AP/语音）。时钟在 RTC 内存（magic 0xD17E）；断电丢时钟→inWindow()=true 常醒直至页面 /time 校准。OTA 45s 观察窗内绝不睡。
+- **API**：apiVer=3；新增 /voice(GET) /voiceLearn /voiceDel /voiceEn /pwSet(en,start="19:30",end="02:30") /time(ts)；/status 增 voice{en,bound,armed,hit} 与 pw{en,clock,inWin,win}。
+- **已知账**：IRAM 96%（SoftwareSerial ISR 常驻，逼近上限，后续加功能先查这里）；flash 343KB/32%。
