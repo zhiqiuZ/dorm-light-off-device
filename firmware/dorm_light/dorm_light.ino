@@ -887,6 +887,7 @@ void setup() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 4);             // 上限 4 台（OA-5）
+  WiFi.setOutputPower(10.5);       // v3 续航刀：发射功率 20.5→10.5dBm，3 米覆盖绰绰有余，均流省 ~20-30mA
   WiFi.setSleep(false);                                        // AP 下关 modem sleep，否则响应抖
   dnsServer.setTTL(30);
   dnsServer.setErrorReplyCode(DNSReplyCode::ServerFailure);
