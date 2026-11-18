@@ -165,7 +165,7 @@ async function refresh(first){const{code,j}=await api("/status",null,2500);
  $("#facts").textContent="本次开机已执行 "+j.countThisBoot+" 次 · "+(j.lastAction==="-"?"尚无动作":fmtAge(j.lastActionAgeSec)+" "+lbl(j.lastAction));
  $("#ver").textContent="v"+j.fwVer;
  if(!inited){inited=true;loadParams();}
- if(!tsDone){tsDone=true;api("/time?ts="+Date.now(),{method:"POST"});}   // D10：手机即时钟（醒来窗口全靠它）
+ if(!tsDone){tsDone=true;var lo=Math.floor(Date.now()/1000-new Date().getTimezoneOffset()*60);api("/time?ts="+lo,{method:"POST"});}   // D10 v3.0.1：手机即时钟=本地墙钟秒（修 v3.0.0 时区差8h）
  paintSys(j);
  if(pending){pollAct();}}
 let inited=false,pending=false,busyNow=false;

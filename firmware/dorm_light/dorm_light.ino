@@ -33,7 +33,7 @@
 #include <EEPROM.h>
 #include <Updater.h>
 
-#define FIRMWARE_VERSION "3.0.0"
+#define FIRMWARE_VERSION "3.0.1"   // v3.0.1: 修时区 bug——/time 现含手机时区偏移（本地墙钟），v3.0.0 醒来窗口整体偏 8h
 
 // ============================================================
 // 1. 承载层常量（FIRMWARE_DESIGN §10 / PRD OA-2、OA-5、OA-7 定案）
