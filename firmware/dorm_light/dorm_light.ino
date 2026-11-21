@@ -33,7 +33,7 @@
 #include <EEPROM.h>
 #include <Updater.h>
 
-#define FIRMWARE_VERSION "3.0.2"   // v3.0.2: 诊断强化——页面禁缓存（防旧 JS 吞掉时区修复）+ /status 自报装置时钟 t
+#define FIRMWARE_VERSION "3.1.0"   // v3.1.0（D17）：夜间深眠改“晶振浅待机”——RC 定时漂移+醒启浪涌两大坑一起拆，准点到秒
 
 // ============================================================
 // 1. 承载层常量（FIRMWARE_DESIGN §10 / PRD OA-2、OA-5、OA-7 定案）
@@ -446,17 +446,39 @@ void servoFollowHome() {
 // ============================================================
 void gateUpdate() { digitalWrite(VOICE_GATE, (VC.en && inWindow() && !otaGrace) ? HIGH : LOW); }
 
-void gotoSleep() {
+// v3.1.0（D17）：弃用"定时器深睡"。ESP8266 睡眠定时器走 RC 振荡器（±10~30% 温漂），
+// 一夜 34 片下来自娱自乐地漂；且每片醒=冷启动浪涌，旧电芯+无大电容直接 brown-out，
+// 表现=“到点不开、插电才开、时有时无”。改为浅待机：WiFi/语音/舵机全关，
+// CPU 靠晶振 delay 循环数时间（毫秒级准），到点开回 AP。电流 ≈18mA，一夜多花 ~0.3Ah 买绝对准点+零浪涌。
+void apStart() {                                               // setup 与“睡醒续命”共用同一拉起序列
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 4);             // 上限 4 台（OA-5）
+  WiFi.setOutputPower(10.5);                                   // v3 续航刀：20.5→10.5dBm
+  WiFi.setSleep(false);                                        // AP 下关 modem sleep，否则响应抖
+  dnsServer.setTTL(30);
+  dnsServer.setErrorReplyCode(DNSReplyCode::ServerFailure);
+  dnsServer.start(53, "*", WiFi.softAPIP());                   // captive 防踢（D7）
+  Serial.printf("[net] AP '%s' ch=%d ip=%s\n", AP_SSID, AP_CHANNEL, WiFi.softAPIP().toString().c_str());
+}
+
+void standbyEnter() {
   if (busy || otaLock || otaGrace) return;
   servoOff();
-  digitalWrite(VOICE_GATE, LOW);
-  int32_t waitS = minutesToStart() * 60;
-  uint32_t chunkS = (waitS > (int32_t)PW_CHUNK_S) ? PW_CHUNK_S : (uint32_t)waitS;
-  if (chunkS < 2) { gateUpdate(); return; }                     // 已到窗口点，继续醒着
-  epochBase += chunkS; rtcPut();
-  Serial.printf("[pw] sleep %us (window-open in %d min)\n", (unsigned)chunkS, (int)(waitS / 60));
-  delay(120);
-  ESP.deepSleep((uint64_t)chunkS * 1000000ULL, (waitS <= (int32_t)PW_CHUNK_S + 60) ? WAKE_RF_DEFAULT : WAKE_NO_RFCAL);
+  digitalWrite(VOICE_GATE, LOW);                               // 语音也断电（同深睡口径）
+  if (VC.en) voiceSer.end();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();                                      // modem-sleep 强制进
+  Serial.println("[pw] standby: wifi off, crystal timing until window");
+  while (PW.en && timeOk && !inWindow()) delay(1000);          // delay 自带喂狗；窗口到/被关掉/时钟丢 → 出
+  WiFi.forceSleepWake();
+  apStart();
+  if (VC.en) voiceSer.begin(VOICE_BAUD);
+  gateUpdate();
+  lastHttpMs = millis();                                       // 刚醒也给 5 分钟宽限，别立刻躺回去
+  Serial.println("[pw] window reached, AP back");
 }
 void loopPower() {
   static uint32_t nextCheck = 0;
@@ -466,7 +488,7 @@ void loopPower() {
   if (!PW.en || !timeOk || inWindow()) return;
   if (now - lastHttpMs < 300000) return;                        // 页面还在用：宽限 5 分钟
   if (busy || otaLock || otaGrace) return;
-  gotoSleep();                                                  // 不返回，直到下个分片醒来
+  standbyEnter();                                               // 阻塞到窗口点：WiFi 关、晶振数时间、零浪涌
 }
 
 void frameHex(const uint8_t* b, uint8_t n, char* out) {
@@ -880,21 +902,12 @@ void setup() {
   pinMode(VOICE_GATE, OUTPUT); digitalWrite(VOICE_GATE, LOW);
   otaGraceBeginOrCheck();
 
-  // D10 快睡路径：定时醒来看表，不在窗口就立刻回去——不开 AP、不起语音，省一整段启动
-  if (PW.en && timeOk && !inWindow() && !otaGrace) gotoSleep();   // 不返回
   gateUpdate();
   if (VC.en) { voiceSer.begin(VOICE_BAUD); Serial.println("[voice] SU-03T uart @9600 RX=D7 TX=idle-D6"); }
 
-  // 承载层：纯 AP（§10）
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 4);             // 上限 4 台（OA-5）
-  WiFi.setOutputPower(10.5);       // v3 续航刀：发射功率 20.5→10.5dBm，3 米覆盖绰绰有余，均流省 ~20-30mA
-  WiFi.setSleep(false);                                        // AP 下关 modem sleep，否则响应抖
-  dnsServer.setTTL(30);
-  dnsServer.setErrorReplyCode(DNSReplyCode::ServerFailure);
-  dnsServer.start(53, "*", WiFi.softAPIP());                   // 所有域名→192.168.4.1：喂饱 OS 探测（D7）
-  Serial.printf("[net] AP '%s' ch=%d ip=%s\n", AP_SSID, AP_CHANNEL, WiFi.softAPIP().toString().c_str());
+  // 承载层：纯 AP（§10）。v3.1：开机若不在窗口 → 直接浅待机（到点自开 AP），不先开热点再躺倒
+  if (PW.en && timeOk && !inWindow() && !otaGrace) standbyEnter();   // 阻塞至窗口点（内部已 apStart）
+  else apStart();                                                    // 在窗口/时钟丢失常醒/OTA 观察窗
 
   if (MDNS.begin(HOSTNAME)) { MDNS.addService("http", "tcp", HTTP_PORT);
     Serial.println("[net] mdns guangdeng.local (bonus only)"); }
