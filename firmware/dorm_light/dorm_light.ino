@@ -33,7 +33,7 @@
 #include <EEPROM.h>
 #include <Updater.h>
 
-#define FIRMWARE_VERSION "3.1.0"   // v3.1.0（D17）：夜间深眠改“晶振浅待机”——RC 定时漂移+醒启浪涌两大坑一起拆，准点到秒
+#define FIRMWARE_VERSION "3.1.1"   // v3.1.1：修 PwCfg 结构体对齐坑（csum 被 padding 挤离尾部→校验自相矛盾→窗口设置重启即丢）+ 页面窗口值回填输入框
 
 // ============================================================
 // 1. 承载层常量（FIRMWARE_DESIGN §10 / PRD OA-2、OA-5、OA-7 定案）
@@ -122,7 +122,7 @@ static const uint16_t PW_MAGIC = 0x5150;   // 'QP'
 
 struct VSlot { uint8_t len; uint8_t b[VFRAME_MAX]; };          // 动作码 = 下标+1
 struct VoiceCfg { uint16_t magic; uint8_t en; VSlot slots[VSLOTS]; uint8_t csum; };
-struct PwCfg    { uint16_t magic; uint8_t en; uint16_t winStart, winEnd; uint8_t csum; };
+struct PwCfg    { uint16_t magic; uint16_t winStart, winEnd; uint8_t en; uint8_t csum; };  // v3.1.1 修复：csum 必须在末字节。原来 uint8 en 夹在两个 uint16 之间，编译器插 1 字节对齐 padding 把 csum 挤离尾部，而 csum8() 约定"跳过最后一字节"——校验和把自己的 csum 也加进去，存取自相矛盾，pw 设置每次重启必失效。重排后 sizeof=8 无 padding。旧数据读取校验不过→自动回默认，属预期一次性重置
 VoiceCfg VC;
 PwCfg    PW;
 

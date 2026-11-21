@@ -242,11 +242,11 @@ $("#fact").onclick=async()=>{if(!confirm("恢复出厂默认会清掉左右灯�
  if(code==200){toast("已恢复默认，请重新校准左右灯");loadParams();}else toast("失败：装置忙或无响应",1);};
 function showHelp(){const h=$("#hp");h.open=true;h.scrollIntoView({behavior:"smooth"});}
 // --- v3 语音 / 夜间模式 ---
-let tsDone=false;
+let tsDone=false,pwFilled=false;
 function paintSys(j){
  if(j.voice){$("#vEn").checked=!!j.voice.en;$("#vBound").textContent=j.voice.bound+"/6 已绑定"+(j.voice.hit!=="-"?" · 上次语音:"+lbl(j.voice.hit):"");}
- if(j.pw){$("#pwEn").checked=!!j.pw.en;
-  $("#pwState").textContent=(j.pw.clock?"时钟已同步":"时钟未同步")+" · 醒着 "+j.pw.win+(j.pw.inWin?" · 当前在窗口内":" · 当前窗口外（闲置 5 分钟后自动深睡）");}}
+ if(j.pw){if(!pwFilled){pwFilled=true;$("#pwEn").checked=!!j.pw.en;var wp=(j.pw.win||"").split("~");if(wp.length==2){$("#pwS").value=wp[0];$("#pwE").value=wp[1];}}
+  $("#pwState").textContent=(j.pw.clock?"时钟已同步":"时钟未同步")+" · 醒着 "+j.pw.win+(j.pw.inWin?" · 当前在窗口内":" · 当前窗口外（闲置 5 分钟后自动浅待机）");}}
 async function loadVoice(){const{code,j}=await api("/voice");if(code!=200||!j)return;
  const tb=$("#vt");tb.innerHTML="";
  j.slots.forEach(s=>{const tr=document.createElement("tr");
