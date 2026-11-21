@@ -33,7 +33,7 @@
 #include <EEPROM.h>
 #include <Updater.h>
 
-#define FIRMWARE_VERSION "3.0.1"   // v3.0.1: 修时区 bug——/time 现含手机时区偏移（本地墙钟），v3.0.0 醒来窗口整体偏 8h
+#define FIRMWARE_VERSION "3.0.2"   // v3.0.2: 诊断强化——页面禁缓存（防旧 JS 吞掉时区修复）+ /status 自报装置时钟 t
 
 // ============================================================
 // 1. 承载层常量（FIRMWARE_DESIGN §10 / PRD OA-2、OA-5、OA-7 定案）
@@ -550,6 +550,7 @@ String statusJson(bool diag = false) {
   s += ",\"voice\":{\"en\":" + jb(VC.en) + ",\"bound\":" + String(boundCount()) + ",\"armed\":" + jb(learnArmed != 0);
   s += ",\"hit\":\"" + String(lastVoiceHit) + "\"}";
   s += ",\"pw\":{\"en\":" + jb(PW.en) + ",\"clock\":" + jb(timeOk) + ",\"inWin\":" + jb(inWindow());
+  s += ",\"t\":\"" + hmStr(minuteOfDay()) + "\"";   // v3.0.2 诊断：装置自报"现在几点"，与真实时间对比=时区/漂移一目了然
   s += ",\"win\":\"" + hmStr(PW.winStart) + "~" + hmStr(PW.winEnd) + "\"}";
   s += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
   s += ",\"apChan\":" + String(AP_CHANNEL);
@@ -618,7 +619,8 @@ bool argInt(const char* name, int& out) {
 
 inline void touch() { lastHttpMs = millis(); }       // D10：页面活跃时间戳（深睡宽限用）
 
-void handleIndex()   { touch(); server.send_P(200, "text/html", PAGE_HTML); }
+void handleIndex()   { touch(); server.sendHeader("Cache-Control", "no-store");   // v3.0.2: 禁缓存——防手机留着旧页面 JS（旧页=不带时区的校时戳，tz 修复会被缓存吞掉）
+                     server.send_P(200, "text/html", PAGE_HTML); }
 void handleFavicon() { server.send(204, "text/plain", ""); }
 void handleStatus()  { touch(); server.send(200, "application/json", statusJson()); }
 
