@@ -50,10 +50,10 @@
 [ ] T7 提交生成固件（云端编译，快则几十秒慢则几分钟，等着）
 [ ] T8 下载生成的 .bin（随机长文件名）→ **移到桌面**（路径不许有中文，
       这是教程点名的第一大坑）
-[ ] T9 烧录：用烧录文档/平台给的下载工具（浏览器打开手册页 help.aimachip.com/docs/
-      offline_su03t/su_03t_kfb 找工具下载；curl 吃它的 JS 壳，你浏览器能看）→
-      工具自动搜串口，不用手选 → ⚠️ 点"下载/烧录"后**拔插模块 Type-C 重新上电**才进下载模式
-      （教程原话：软件点下载后，需断电再连接！）→ 等"下载成功"
+[ ] T9 烧录：软件本机已有（2025 年资料包）——D:\SU03T\Hummingbird-M-Update-Tool\
+      UniOneUpdateTool.exe（unionedebug.ini 实锤纯串口：COM 口+115200 握手+921600 高速，
+      SPL_DOWNLOAD=1 免按键）；用它加载 .bin → 点下载 → 拔插模块 Type-C 重新上电
+      → 等"下载成功"。说明书：同目录 USB_Update_Tool_User_Guide.pdf
 [ ] T10 运行接线复位：模块 Type-C 改充电头供电或直接 VCC→5V 轨、G→GND、
       模块 **B7（TXD）→ D7/GPIO13**（别接成 B2/B3 那组复用脚！）；
       装置醒着开页面 → 喊"全关"两遍 → 最近帧两次 hex 应都是 A1 →
